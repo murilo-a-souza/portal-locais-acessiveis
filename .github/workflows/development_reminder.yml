@@ -1,4 +1,4 @@
-name: Issue reminder & auto-unassign
+name: Issue reminder & auto-unassign (projects v2)
 
 on:
   schedule:
@@ -14,8 +14,8 @@ jobs:
     env:
       PROJECT_STATUS_READY: 'Pronta para iniciar'
       PROJECT_STATUS_IN_DEV: 'Em desenvolvimento'
+      PROJECT_FIELD_NAME: 'Status'
       MARKER: '<!-- issue-reminder-bot -->'
-      PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
     steps:
       - name: Use Node
         uses: actions/setup-node@v4
@@ -25,87 +25,114 @@ jobs:
       - name: Install dependencies
         run: |
           npm init -y
-          npm install @octokit/rest
+          npm install @octokit/rest @octokit/graphql
 
-      - name: Run reminder script
+      - name: Run reminder script (supports Projects v2)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
           PROJECT_STATUS_READY: ${{ env.PROJECT_STATUS_READY }}
           PROJECT_STATUS_IN_DEV: ${{ env.PROJECT_STATUS_IN_DEV }}
+          PROJECT_FIELD_NAME: ${{ env.PROJECT_FIELD_NAME }}
           MARKER: ${{ env.MARKER }}
         run: |
-          cat > reminder.js <<'JS'
-          const { Octokit } = require("@octokit/rest");
+          cat > reminder_v2.js <<'JS'
+          const { Octokit } = require('@octokit/rest');
+          const { graphql } = require('@octokit/graphql');
+
+          function normalizeName(s) {
+            if (!s) return '';
+            return s.normalize && s.normalize('NFD').replace(/\p{Diacritic}/gu, '').trim().toLowerCase();
+          }
 
           (async () => {
             try {
               const repoFull = process.env.GITHUB_REPOSITORY;
-              if (!repoFull) throw new Error("GITHUB_REPOSITORY not set");
-              const [owner, repo] = repoFull.split("/");
+              if (!repoFull) throw new Error('GITHUB_REPOSITORY not set');
+              const [owner, repo] = repoFull.split('/');
 
               const READY = (process.env.PROJECT_STATUS_READY || 'Pronta para iniciar').trim();
               const INDEV = (process.env.PROJECT_STATUS_IN_DEV || 'Em desenvolvimento').trim();
+              const FIELD_NAME = (process.env.PROJECT_FIELD_NAME || 'Status').trim();
               const marker = process.env.MARKER || '<!-- issue-reminder-bot -->';
+
               const now = new Date();
               const ONE_DAY = 24 * 60 * 60 * 1000;
               const TWO_DAYS = 2 * ONE_DAY;
 
-              // Octokit para issues (usa GITHUB_TOKEN)
               const issuesOctokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+              const graphqlWithAuth = graphql.defaults({ headers: { authorization: `token ${process.env.GITHUB_TOKEN}` } });
 
-              // Octokit para Projects (usa PROJECTS_TOKEN se definido)
-              let projectsOctokit = null;
-              if (process.env.PROJECTS_TOKEN) {
-                projectsOctokit = new Octokit({ auth: process.env.PROJECTS_TOKEN });
-                console.log("PROJECTS_TOKEN definido — usando API de Projects clássicos.");
-              } else {
-                console.warn("PROJECTS_TOKEN não definido — fazendo fallback por labels.");
-              }
-
-              // Mapeia issue_number => status
               const issueStatus = {};
 
-              if (projectsOctokit) {
-                // Lista projects do repo (classic projects)
-                const projects = await projectsOctokit.paginate(projectsOctokit.rest.projects.listForRepo, { owner, repo, per_page: 100 });
-                console.log(`Projects encontrados: ${projects.length}`);
-                const readyColumnIds = [];
-                const inDevColumnIds = [];
-
-                for (const p of projects) {
-                  const cols = await projectsOctokit.paginate(projectsOctokit.rest.projects.listColumns, { project_id: p.id, per_page: 100 });
-                  for (const c of cols) {
-                    if ((c.name || '').trim().toLowerCase() === READY.toLowerCase()) readyColumnIds.push(c.id);
-                    if ((c.name || '').trim().toLowerCase() === INDEV.toLowerCase()) inDevColumnIds.push(c.id);
-                  }
-                }
-
-                console.log(`Colunas '${READY}': ${readyColumnIds.length}, '${INDEV}': ${inDevColumnIds.length}`);
-
-                async function processCards(columnId, statusName) {
-                  const cards = await projectsOctokit.paginate(projectsOctokit.rest.projects.listCards, { column_id: columnId, per_page: 100 });
-                  for (const card of cards) {
-                    if (!card.content_url) continue;
-                    if (card.content_url.includes('/issues/')) {
-                      const num = parseInt(card.content_url.split('/issues/')[1], 10);
-                      if (!isNaN(num)) {
-                        if (issueStatus[num] === INDEV) continue; // INDEV tem prioridade
-                        issueStatus[num] = statusName;
+              console.log('Buscando Projects v2 via GraphQL...');
+              const projectsQuery = `query($owner:String!, $repo:String!, $itemsFirst:Int!) {
+                repository(owner:$owner, name:$repo) {
+                  projectsV2(first:100) {
+                    nodes {
+                      id
+                      title
+                      items(first:$itemsFirst) {
+                        nodes {
+                          id
+                          content {
+                            ... on Issue { number }
+                          }
+                          fieldValues(first:50) {
+                            nodes {
+                              __typename
+                              ... on ProjectV2ItemFieldSingleSelectValue { projectField { name } name }
+                              ... on ProjectV2ItemFieldTextValue { projectField { name } text }
+                              ... on ProjectV2ItemFieldNumberValue { projectField { name } number }
+                              ... on ProjectV2ItemFieldSingleSelectValues { projectField { name } names }
+                            }
+                          }
+                        }
                       }
                     }
                   }
                 }
+              }`;
 
-                for (const id of inDevColumnIds) await processCards(id, INDEV);
-                for (const id of readyColumnIds) await processCards(id, READY);
+              const res = await graphqlWithAuth({ query: projectsQuery, owner, repo, itemsFirst: 100 });
+              const projects = (((res || {}).repository || {}).projectsV2 || {}).nodes || [];
+              console.log(`Projects v2 encontrados: ${projects.length}`);
 
-                console.log(`Mapped ${Object.keys(issueStatus).length} issues from Projects columns.`);
+              for (const p of projects) {
+                const items = (p.items && p.items.nodes) || [];
+                for (const item of items) {
+                  const issueNumber = item.content && item.content.number;
+                  if (!issueNumber) continue;
+
+                  const fieldVals = (item.fieldValues && item.fieldValues.nodes) || [];
+                  for (const fv of fieldVals) {
+                    const pfName = normalizeName((fv.projectField && fv.projectField.name) || '');
+                    const targetField = normalizeName(FIELD_NAME);
+                    if (pfName !== targetField) continue;
+
+                    let val = null;
+                    if (fv.__typename === 'ProjectV2ItemFieldSingleSelectValue') val = fv.name;
+                    if (fv.__typename === 'ProjectV2ItemFieldTextValue') val = fv.text;
+                    if (fv.__typename === 'ProjectV2ItemFieldNumberValue') val = fv.number && String(fv.number);
+                    if (fv.__typename === 'ProjectV2ItemFieldSingleSelectValues') val = (fv.names && fv.names[0]) || null;
+
+                    if (!val) continue;
+
+                    const normVal = normalizeName(val);
+                    if (normVal === normalizeName(READY)) {
+                      if (issueStatus[issueNumber] === INDEV) continue;
+                      issueStatus[issueNumber] = READY;
+                    }
+                    if (normVal === normalizeName(INDEV)) {
+                      issueStatus[issueNumber] = INDEV;
+                    }
+                  }
+                }
               }
 
-              // Fallback por labels se não obteve issues via Projects
+              console.log(`Mapped ${Object.keys(issueStatus).length} issues from Projects v2 field '${FIELD_NAME}'.`);
+
               if (Object.keys(issueStatus).length === 0) {
-                console.log("Nenhum mapping via Projects — usando labels como fallback.");
+                console.log('Nenhum mapping via Projects v2 — usando labels como fallback.');
                 const allIssues = await issuesOctokit.paginate(issuesOctokit.rest.issues.listForRepo, { owner, repo, state: 'open', per_page: 100 });
                 let count = 0;
                 for (const issue of allIssues) {
@@ -117,7 +144,6 @@ jobs:
                 console.log(`Fallback labels mapped ${count} issues.`);
               }
 
-              // Processa issues abertas com base no issueStatus
               const issues = await issuesOctokit.paginate(issuesOctokit.rest.issues.listForRepo, { owner, repo, state: 'open', per_page: 100 });
               for (const issue of issues) {
                 if (issue.pull_request) continue;
@@ -147,7 +173,7 @@ jobs:
                 }
 
                 if (!lastBotComment) {
-                  const body = `${marker}\nOlá ${assignees.length ? `@${assignees[0]}` : '@assignee'}, esta issue está no status **${READY}** — por favor, coloque-a em **${INDEV}** em até 24 horas. Vou lembrar novamente amanhã se nada mudar.`;
+                  const body = `${marker}\nOlá ${assignees.length ? `@${assignees[0]}` : '@assignee'}, esta issue está no status **${READY}** — por favor, coloque-a em **${INDEV}** em até 24 horas ou confirme que continuará com ela.`;
                   await issuesOctokit.rest.issues.createComment({ owner, repo, issue_number: num, body });
                   console.log(`Primeiro lembrete postado em #${num}`);
                   continue;
@@ -160,7 +186,7 @@ jobs:
 
                 if (diff >= ONE_DAY && diff < TWO_DAYS) {
                   if (assigneeCommentedAfter) { console.log(`#${num}: assignee respondeu depois do lembrete`); continue; }
-                  const body = `${marker}\nSegunda chamada para ${assignees.length ? `@${assignees[0]}` : '@assignee'}: esta issue ainda não foi movida para **${INDEV}**. Por favor, confirme que começou em até 24 horas, caso contrário os assignments serão removidos.`;
+                  const body = `${marker}\nSegunda chamada para ${assignees.length ? `@${assignees[0]}` : '@assignee'}: esta issue ainda não foi movida para **${INDEV}**. Por favor, confirme que irá começar.`;
                   await issuesOctokit.rest.issues.createComment({ owner, repo, issue_number: num, body });
                   console.log(`Segunda chamada postada em #${num}`);
                   continue;
@@ -175,11 +201,12 @@ jobs:
                   console.log(`Assignees removidos de #${num}`);
                 }
               }
+
             } catch (err) {
-              console.error("Erro no script:", err);
+              console.error('Erro no script:', err);
               process.exit(1);
             }
           })();
           JS
 
-          node reminder.js
+          node reminder_v2.js
